@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import type { ApiKeyConfig, AppConfig, ProfileConfig, RequestRouteTraceChange, RequestStreamMetrics, RouterFallbackConfig } from "@ccr/core/contracts/app";
+import type { ApiKeyConfig, AppConfig, GatewayProviderProtocol, ProfileConfig, RequestRouteTraceChange, RequestStreamMetrics, RouterFallbackConfig } from "@ccr/core/contracts/app";
 import {
   createSseErrorDetector,
   markGatewayRequestLogDropped,
@@ -70,6 +70,41 @@ export type GatewayRequestPipelineDependencies = {
   getPlugin: () => ClaudeCodeRouterPlugin | undefined;
   getStatus: () => { coreEndpoint: string; endpoint: string };
 };
+
+/**
+ * The one terminal error frame a protocol offers for a stream that dies after frames were relayed, so a
+ * client can tell the truncation apart from a clean end and classify a retry (#1917). `undefined` for
+ * protocols with no in-band error event — those keep the socket close as the failure signal.
+ */
+function streamTerminalErrorFrame(
+  protocol: GatewayProviderProtocol | undefined,
+  message: string
+): string | undefined {
+  const text = message.trim() || "upstream stream failed";
+  if (protocol === "anthropic_messages") {
+    return `event: error
+data: ${JSON.stringify({ type: "error", error: { type: "api_error", message: text } })}
+
+`;
+  }
+  if (protocol === "openai_chat_completions") {
+    return `data: ${JSON.stringify({ error: { message: text, type: "api_error" } })}
+
+data: [DONE]
+
+`;
+  }
+  if (protocol === "openai_responses") {
+    return `event: response.failed
+data: ${JSON.stringify({ type: "response.failed" })}
+
+data: [DONE]
+
+`;
+  }
+  return undefined;
+}
+
 
 function reportedRouteChange(
   scope: RequestRouteTraceChange["scope"],
@@ -1108,20 +1143,41 @@ export class GatewayRequestPipeline {
         upstreamExperienceMeter.finish();
         clientExperienceMeter.finish();
         streamDetectedError ??= sseErrorDetector.finish();
-        writeStreamLog(clientDisconnected ? clientDisconnectMessage : formatUpstreamErrorForLog(error, {
-          attempts: upstreamResult.failedAttempts.length + 1,
-          elapsedMs: Date.now() - startedAt,
-          fallbackFailures: upstreamResult.failedAttempts.length,
-          operation: "stream",
-          responseStarted: true,
-          retryDelayMs: upstreamResult.failedAttempts.reduce(
-            (total, attempt) => total + Math.max(0, attempt.delayMs ?? 0),
-            0
-          )
-        }));
-        // .pipe() does not end the client response when a stage errors, so an
-        // upstream reset would leave the client waiting forever. Headers are
-        // already sent; closing the socket is how a truncated stream fails.
+        const streamError = clientDisconnected
+          ? clientDisconnectMessage
+          : formatUpstreamErrorForLog(error, {
+              attempts: upstreamResult.failedAttempts.length + 1,
+              elapsedMs: Date.now() - startedAt,
+              fallbackFailures: upstreamResult.failedAttempts.length,
+              operation: "stream",
+              responseStarted: true,
+              retryDelayMs: upstreamResult.failedAttempts.reduce(
+                (total, attempt) => total + Math.max(0, attempt.delayMs ?? 0),
+                0
+              )
+            });
+        writeStreamLog(streamError);
+        // .pipe() does not end the client response when a stage errors, so an upstream reset would leave
+        // the client waiting forever. When the client has not seen a terminal event yet, write exactly one
+        // protocol-native error frame and end the response, so a truncation is distinguishable from a clean
+        // end (#1917). Everywhere else — no in-band error for the protocol, a body the compact transform
+        // rewrote into JSON, a gone client — closing the socket stays the failure signal.
+        if (
+          !clientDisconnected &&
+          !sseErrorDetector.hasTerminalEvent() &&
+          !response.writableEnded &&
+          !response.destroyed &&
+          (responseHeaders.get("content-type") ?? "").toLowerCase().includes("text/event-stream") &&
+          !(transformCodexCompactResponse && codexCompactCompatResponseMode)
+        ) {
+          const frame = streamTerminalErrorFrame(responseProtocol, streamError);
+          if (frame) {
+            response.write(frame);
+            response.end();
+            destroyResponseStreams(responseStreams);
+            return;
+          }
+        }
         if (!response.destroyed) {
           response.destroy();
         }
